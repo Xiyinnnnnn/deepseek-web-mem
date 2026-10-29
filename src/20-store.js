@@ -2,6 +2,7 @@
 // 布局：一条记忆一个 key，避免每轮重写整个数组。
 import { CONFIG } from './02-config.js'
 import { stats } from './01-stats.js'
+import { countByKind } from './15-token-est.js'
 
 export function makeLocalBackend() {
   return {
@@ -41,6 +42,22 @@ function cutText(t, limit) {
   var s = String(t || '')
   if (s.length <= limit) return { text: s, truncated: false }
   return { text: s.slice(0, limit), truncated: true }
+}
+
+// 索引项：只用元数据，不保存正文。cjk/other 供「按会话估算上下文 token」直接累加。
+function entryOf(rec) {
+  var cu = countByKind(rec.userText || '')
+  var ca = countByKind(rec.aiText || '')
+  return {
+    id: rec.id,
+    sessionId: rec.sessionId,
+    parentMessageId: rec.parentMessageId == null ? null : rec.parentMessageId,
+    normUser: normText(rec.userText),
+    timestamp: rec.timestamp || 0,
+    len: (rec.userText || '').length + (rec.aiText || '').length,
+    cjk: cu.cjk + ca.cjk,
+    other: cu.other + ca.other
+  }
 }
 
 export function createStore(backend) {
@@ -87,14 +104,7 @@ export function createStore(backend) {
       var r = entries[i].rec
       ids.push(r.id)
       totalChars += (r.userText || '').length + (r.aiText || '').length
-      index[r.id] = {
-        id: r.id,
-        sessionId: r.sessionId,
-        parentMessageId: r.parentMessageId == null ? null : r.parentMessageId,
-        normUser: normText(r.userText),
-        timestamp: r.timestamp || 0,
-        len: (r.userText || '').length + (r.aiText || '').length
-      }
+      index[r.id] = entryOf(r)
     }
     meta = { v: CONFIG.SCHEMA_VERSION, ids: ids, chars: totalChars, savedAt: Date.now() }
     writeMeta()
@@ -125,12 +135,7 @@ export function createStore(backend) {
         for (var i = 0; i < entries.length; i++) {
           var r = entries[i].rec
           totalChars += (r.userText || '').length + (r.aiText || '').length
-          index[r.id] = {
-            id: r.id, sessionId: r.sessionId,
-            parentMessageId: r.parentMessageId == null ? null : r.parentMessageId,
-            normUser: normText(r.userText), timestamp: r.timestamp || 0,
-            len: (r.userText || '').length + (r.aiText || '').length
-          }
+          index[r.id] = entryOf(r)
         }
         if (entries.length === 0) { index = Object.create(null); totalChars = 0 }
       }
@@ -286,10 +291,7 @@ export function createStore(backend) {
       return { ok: false, reason: 'meta_write', evicted: evicted }
     }
 
-    index[rec.id] = {
-      id: rec.id, sessionId: rec.sessionId, parentMessageId: rec.parentMessageId,
-      normUser: normText(rec.userText), timestamp: rec.timestamp, len: delta
-    }
+    index[rec.id] = entryOf(rec)
     stats.inc('saved')
     stats.set('lastSavedAt', rec.timestamp)
     stats.save()
@@ -315,8 +317,7 @@ export function createStore(backend) {
     totalChars += delta
     meta.chars = totalChars
     writeMeta()
-    var m = index[id]
-    if (m) m.len = String(rec.userText || '').length + rec.aiText.length
+    index[id] = entryOf(rec)
     stats.inc('ai_filled')
     return { ok: true, id: id, rec: rec }
   }
@@ -326,6 +327,23 @@ export function createStore(backend) {
       var raw = be.getItem(CONFIG.KEY_PREFIX + id)
       return raw ? JSON.parse(raw) : null
     } catch (e) { stats.inc('read_fail'); return null }
+  }
+
+  // 只遍历内存里的索引目录，不读 localStorage：每轮结束都要算一次，必须够快
+  function sessionCounts(sessionId) {
+    var sid = String(sessionId == null ? '' : sessionId)
+    var out = { cjk: 0, other: 0, count: 0, chars: 0 }
+    if (!sid) return out
+    var ids = meta.ids
+    for (var i = 0; i < ids.length; i++) {
+      var m = index[ids[i]]
+      if (!m || String(m.sessionId) !== sid) continue
+      out.cjk += m.cjk || 0
+      out.other += m.other || 0
+      out.chars += m.len || 0
+      out.count++
+    }
+    return out
   }
 
   function all() {
@@ -376,6 +394,8 @@ export function createStore(backend) {
     count: function () { return meta.ids.length },
     chars: function () { return totalChars },
     metaOf: function (id) { return index[id] || null },
+    // 该会话累计的字符量：cjk/other 分开计数，交给 15-token-est 折算 token
+    sessionCounts: sessionCounts,
     rebuild: rebuild
   }
 }

@@ -8,7 +8,9 @@ import { createIndexLayer } from './60-index.js'
 import { planInjection, withTimeout } from './70-retrieve.js'
 import { createRequestContext, finalizeOnce, createBreaker, createInjectedRegistry, createSessionSwitch, toast } from './80-context.js'
 import { isTargetRequest, isSupportedForm, parseRequest, buildModifiedInit, buildModifiedBody, commandResponse, fakeXhrDone } from './90-protocol.js'
-import { parseCommand, installInputCommand } from './85-input-command.js'
+import { parseCommand, installInputCommand, HELP } from './85-input-command.js'
+import { createCompressor } from './95-summarize.js'
+import { tokensOfCounts } from './15-token-est.js'
 import { createSseParser } from './40-sse.js'
 import { createMachine, STATUS } from './50-machine.js'
 import { extractFromRawText } from './45-fallback.js'
@@ -52,6 +54,7 @@ function boot() {
   // 页面显示的是用户原文，服务端收到的是带记忆块的文本（设计文档 8.5 第 5 点）。
   // 因此「是否真的注入了」只能靠这份记录自证。
   var lastSent = { prompt: '', injected: false, ids: [], at: 0 }
+  var lastInfo = null           // 最近一次目标请求的会话信息，/sum 估算上下文要用
 
   var breaker = createBreaker(function () {
     toast('记忆：注入被拒，本页面已暂停注入', 'breaker')
@@ -115,8 +118,54 @@ function boot() {
   try { initStorage() } catch (e) {}
   setTimeout(initIndex, 0)
   try { installXhr() } catch (e) {}
+
+  // ---- /sum 上下文压缩：手动 /sum + 超阈值自动 ----
+  // 唯一需要准备的东西是「当前会话已经有多大」，所以把 store 的会话统计和会话 id 交给它。
+  var compressor = createCompressor({
+    contextTokens: contextTokens,
+    currentSession: currentSession,
+    // 摘要本身也进记忆库：新对话里再聊到相关话题时，这段摘要能被检索回来
+    onSummary: function (text, from) {
+      try {
+        if (!store) return
+        var r = store.put({
+          sessionId: 'dsmem_summary',
+          parentMessageId: null,
+          userText: String(text || '').slice(0, 1900),
+          aiText: '',
+          injected: false,
+          injectedIds: []
+        })
+        if (r && r.ok) {
+          stats.inc('sum_saved')
+          if (index) { var rec = store.get(r.id); if (rec) index.addRecord(rec) }
+        }
+      } catch (e) {}
+    }
+  })
+  try { compressor.resume() } catch (e) {}
+
   // 输入框快捷指令：命令在这里就被吃掉，根本不会产生请求
   try { installInputCommand({ run: runCommandText }) } catch (e) {}
+
+  // ---- 当前会话 id：优先最近一次请求，其次地址栏 /a/chat/s/<id> ----
+  function currentSession() {
+    try { if (lastInfo && lastInfo.sessionId) return String(lastInfo.sessionId) } catch (e) {}
+    try {
+      var m = /\/a\/chat\/s\/([A-Za-z0-9_-]+)/.exec(String((location && location.pathname) || ''))
+      if (m) return m[1]
+    } catch (e) {}
+    return ''
+  }
+
+  // ---- 上下文规模：本会话已落库的 user+ai 文本，按中英字符折算 ----
+  // 口径来自需求：1 个中文字符 ≈ 0.6 token，1 个英文字符 ≈ 0.3 token。
+  function contextTokens() {
+    if (!store) return 0
+    var sid = currentSession()
+    if (!sid) return 0
+    return tokensOfCounts(store.sessionCounts(sid))
+  }
 
   // ---- 5.3 保持原始响应语义 ----
   function recordSent(init, modifiedInit, ids) {
@@ -236,6 +285,20 @@ function boot() {
       runCommandLocal(info.command)
       return commandResponse({ code: 0, msg: 'DSMEM command handled locally' })
     }
+    lastInfo = info
+
+    // /sum 压缩请求：不注入、不落库，原样发出，只旁听响应拿摘要
+    if (compressor.isSummaryRequest(info)) {
+      stats.inc('sum_request')
+      var sctx = createRequestContext(info)
+      sctx.isSummary = true
+      var sumRes = originalFetch.call(receiver, input, init)
+      try {
+        sumRes.then(function (res) { try { observeFetch(res, sctx) } catch (e) {} },
+                    function () { try { compressor.finish('') } catch (e) {} })
+      } catch (e) {}
+      return sumRes
+    }
     if (sessionSwitch.isGlobalOff()) {          // /mem off：原样放行，不记录也不注入
       stats.inc('off_pass')
       return originalFetch.call(receiver, input, init)
@@ -334,6 +397,17 @@ function boot() {
             fakeXhrDone(self, 400, JSON.stringify({ code: 1, msg: 'handled locally' }))
             return
           }
+          // /sum 压缩请求：不注入、不落库，原样发出，响应侧交给 finish 取摘要
+          if (compressor.isSummaryRequest(info)) {
+            stats.inc('sum_request')
+            lastInfo = info
+            var sctx = createRequestContext(info)
+            sctx.isSummary = true
+            observeXhr(self, sctx)
+            return XS.call(self, body)
+          }
+          lastInfo = info
+
           if (sessionSwitch.isGlobalOff()) { stats.inc('off_pass'); return XS.apply(this, arguments) }
 
           var early = createRequestContext(info)
@@ -471,6 +545,18 @@ function boot() {
     // 无条件留样本：提取成功时更该留，否则永远拿不到真实响应结构去回填 PROTOCOL.sse
     if (rawText && rawText.length > 20) saveTap(rawText)
     var result = machine.result()
+
+    // /sum 压缩请求：只把正文交给压缩模块，既不入库也不参与注入统计
+    if (ctx && ctx.isSummary) {
+      var dead = (result.status === STATUS.CANCELLED || result.status === STATUS.FAILED)
+      var sumText = dead ? '' : String(result.text || '').trim()
+      if (!sumText && !dead && rawText) {
+        try { sumText = String(extractFromRawText(rawText) || '').trim() } catch (e) {}
+      }
+      try { compressor.finish(sumText) } catch (e) {}
+      return
+    }
+
     if (result.status === STATUS.CANCELLED || result.status === STATUS.FAILED) {
       // 审核撤回时正文可能已部分到达，同样不保留
       rollbackPending(ctx)
@@ -515,6 +601,9 @@ function boot() {
         }
       }
     })
+
+    // 每轮结束后按会话规模判定一次：达到阈值就自动发 [总结所有]（自带冷却，不会连环触发）
+    try { compressor.maybeAuto() } catch (e) {}
   }
 
   function maybeProtocolAlert() {
@@ -523,10 +612,20 @@ function boot() {
     }
   }
 
-  // ---- 13.3 管理指令：只有三条 on / off / clear ----
+  // ---- 13.3 管理指令：/mem on|off|clear 与 /sum ----
+  // cmd = { cmd:'mem'|'sum', sub:'on'|'off'|'clear'|'', unknown:bool }；也接受纯字符串子命令。
   // 返回一句文案；不弹提示、不发网络、不落库。提示由调用方决定。
-  function applyCommand(sub) {
-    var t = String(sub || '').toLowerCase().trim()
+  function applyCommand(cmd) {
+    var c = (cmd && typeof cmd === 'object') ? cmd : { cmd: 'mem', sub: cmd, unknown: false }
+    var t = String(c.sub || '').toLowerCase().trim()
+    var name = String(c.cmd || 'mem').toLowerCase()
+
+    if (name === 'sum') {
+      if (t) return HELP                    // /sum 只有裸命令，带参数按用法提示处理
+      return compressor.manual()
+    }
+    if (c.unknown && t) return HELP          // /mem 后面跟了看不懂的词
+
     if (t === 'on') {
       sessionSwitch.clearAll()
       sessionSwitch.setGlobalOff(false)
@@ -547,19 +646,17 @@ function boot() {
       stats.inc('mem_cleared')
       return '记忆：已清空 ' + n + ' 条'
     }
-    return '记忆：可用指令 /mem on、/mem off、/mem clear'
+    return HELP
   }
 
-  // 输入框入口：纯执行，提示由 85-input-command 的 apply() 弹
+  // 输入框入口传 {cmd,sub}；网络兜底传整条命令文本
   function runCommandText(raw) {
+    if (raw && typeof raw === 'object') return applyCommand(raw)
     var t = String(raw == null ? '' : raw).trim()
-    var sub = t
-    if (t.charAt(0) === '/') {                 // 网络兜底传进来的是整条命令文本
-      var c = null
-      try { c = parseCommand(t) } catch (e) {}
-      sub = c ? c.sub : ''
-    }
-    return applyCommand(sub)                   // 输入框入口传进来的是子命令本身
+    var c = null
+    if (t.charAt(0) === '/') { try { c = parseCommand(t) } catch (e) {} }
+    if (!c) c = { cmd: 'mem', sub: t, unknown: false }
+    return applyCommand(c)
   }
 
   // 网络层兜底：输入框没抓到（改版 / 语音发送 / 别的键盘）时，执行 + 提示
@@ -613,6 +710,8 @@ function boot() {
                '  chars=' + (store ? store.chars() : -1))
         L.push('index      = ' + (index ? index.state() : 'null'))
         L.push('tokenizer  = ' + tokenizerMode())
+        L.push('context    = 约 ' + Math.round(contextTokens() / 1000) + 'K token（会话 ' + (currentSession() || '-') + '）')
+        L.push('compressor = ' + compressor.status())
         L.push('fetch      = ' + (/native code/.test(String(window.fetch)) ? '原生(未接管)' : '已接管'))
         L.push('xhr        = ' + (typeof XMLHttpRequest !== 'undefined' && XMLHttpRequest.prototype.__dsmHooked ? '已接管' : '未接管'))
         L.push('存储可用   = ' + (capabilities.localStorage ? 'localStorage' : '内存(不持久)'))
@@ -697,6 +796,10 @@ function boot() {
         return text
       },
       lastSent: function () { return lastSent },
+      // /sum 相关：手动压缩、当前上下文估算、压缩状态
+      sum: function () { var m = compressor.manual(); return m },
+      estimate: function () { return contextTokens() },
+      sumStatus: function () { return compressor.status() },
       memList: function () {
         if (!store) return []
         return store.all().map(function (r) {

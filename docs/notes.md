@@ -170,4 +170,64 @@ node test/t05-no-segmenter.mjs   # 无 Intl.Segmenter 环境冒烟
 - 协议未抓包，`PROTOCOL.endpointPath` 为 null 时脚本对目标请求全部放行，只注册拦截器不做事（设计如此）。
 - 仅支持 `fetch(url, init)` 且 `body` 为字符串；Request 对象、FormData、二进制全部放行并计数 `skip_unsupported_form`。
 - 无 `Intl.Segmenter` 时降级二元组分词，单字中文查询召回有限，阈值需另行校准。
-- `/mem clear` 需 30 秒内二次确认；`/mem` 指令用 400 响应中断页面请求，真机表现待阶段 1 验证。
+- `/sum` 依赖「新对话页 = `https://chat.deepseek.com/`」这一前提；站点改版后改 `SUM_NEW_CHAT_URL` 即可。
+- `/sum` 的自动触发频率取决于脚本观察到多少轮次，历史会话说到底只能靠服务端上下文，本地估算只是下界。
+
+## 新增：`/sum` 上下文压缩（随 1.0 发布）
+
+### 需求
+
+1. 一个手动命令 `/sum`，其余全部自动。
+2. 按字符粗估上下文规模（中文 0.6 token/字、英文 0.3 token/字），约 70 万 token 自动触发。
+3. 触发方式 = hook 用户输入，发一条 `[总结所有]` 的 user 消息；端点返回的摘要**直接开一个新对话**继续。
+
+### 关键取舍：不自己造请求
+
+自己发一条压缩请求意味着要复刻页面的 `Authorization`、PoW 头（`x-ds-pow-response` 一类）与
+请求体签名。这些东西是页面每次现算的，抄一份存着必然过期，写错了还会污染正常聊天。
+
+所以改为**把输入框原地改写成 `[总结所有]`，让页面自己发**：
+
+| 步 | 动作 | 实现位置 |
+|---|---|---|
+| 1 | 原生 setter 写值 + `input` 事件（否则 React state 不回写，点发送发的是空串） | `85-input-command.js` `writeValue` |
+| 2 | 先补一个 `keydown Enter`（页面正常就是 Enter 发送），250ms 后输入框仍有内容 → 点发送键，再 500ms 还有 → toast 提示手动发 | `submitInput` |
+| 3 | 网络层认出这条请求（`prompt === '[总结所有]'` 且落在 `SUM_ARM_MS` 时间窗内）→ 不注入、不落库，原样 `send`，只旁听响应 | `99-main.js` 两个通道各一处 |
+| 4 | 响应正文到手 → 存 `sessionStorage` 交接单 → `location.href` 跳新对话首页 | `95-summarize.js` `finish` |
+| 5 | 新页面 boot → 读交接单 → 等输入框（300ms 轮询，最多 20s）→ 写摘要 → 触发发送 → 删交接单 | `95-summarize.js` `resume` |
+
+时间窗 `SUM_ARM_MS = 30s` 是必要的：`[总结所有]` 是普通文本，用户完全可以自己发这句话。
+没有时间窗就会出现「用户自己想总结一下」被脚本当成交接动作的情况。窗口外命中记 `sum_stray` 并当普通消息落库。
+
+### 上下文估算是下界
+
+`store.sessionCounts(sessionId)` 只累加**脚本观察到的**轮次，且单条 `aiText` 落库时截断到 4000 字符，
+所以算出来的是下界。真机上这个下界越大，估算越保守——阈值 70 万 token 属于用户指定值，
+实际对话上下文远小于此，想让它起作用就把 `SUM_TRIGGER_TOKENS` 往下调。
+
+估算按索引项里的 `cjk` / `other` 计数直接折算，不读 `localStorage` 正文：每轮结束都要算一次，
+扫一遍全部条目在真机上会卡。
+
+### 落地保护
+
+| 风险 | 处置 |
+|---|---|
+| 压缩完成后用户又打开旧会话，交接单把摘要灌进旧对话 | `resume()` 先看地址栏：还是 `/a/chat/s/<id>` 就跳过（`resume-skip-old-chat`），交接单留着 |
+| 摘要为空 / 被取消生成 | 短于 `SUM_MIN_TEXT_CHARS` 视为失败，只 toast，不跳转、不动原对话 |
+| 新对话输入框迟迟不出现 | 20s 超时后提示「摘要已保留」，交接单不删，下次打开还能续 |
+| 交接单保质期 | `SUM_PENDING_TTL_MS = 10 分钟`，过期丢弃，避免几天后突然冒出一条摘要 |
+| `sessionStorage` 不可用（部分 WebView） | 退回 `localStorage`；都没有就只在本页内存里，压缩退化为「不跨页」 |
+
+### 自我压缩导致的死循环
+
+压缩请求走 `isSummaryRequest` 分支后直接 `return`，既不过 `saveUser` 也不走 `finalizeOnce`，
+所以不会触发 `maybeAuto`；`SUM_COOLDOWN_MS` 再兜一层。摘要本身另存 `sessionId='dsmem_summary'`，
+与当前会话无关，不会推高当前会话的估算值。
+
+### 测试
+
+`test/t70-sum.mjs` 26 项：命令拦截至不出网、输入框被改写、请求旁路不落库、摘要捕获与交接单、
+新页面落地、估算口径（100 中文 + 100 英文 = 90 token）、超阈值自动触发、
+时间窗外的 `[总结所有]` 记 `sum_stray`、`/sum` 带参数只回用法。
+
+合计 **108 项**（24 + 17 + 27 + 14 + 26）。

@@ -9,7 +9,9 @@ var KEYS = [
   'save_fail', 'save_quota_fail', 'read_fail',
   'parse_fail_run', 'extract_fail_run', 'mem_cleared',
   'ai_filled', 'xhr_hit', 'xhr_inject_ok', 'saved_pending', 'tap_saved', 'xhr_aborted_before_send', 'rollback',
-  'cmd_local', 'cmd_blocked_xhr', 'cmd_blocked_fetch', 'off_pass'
+  'cmd_local', 'cmd_blocked_xhr', 'cmd_blocked_fetch', 'off_pass',
+  // /sum 上下文压缩
+  'sum_request', 'sum_manual', 'sum_auto', 'sum_done', 'sum_fail', 'sum_stray', 'sum_resume', 'sum_saved'
 ]
 
 export var stats = (function () {

@@ -126,8 +126,9 @@ export function parseRequest(input, init) {
     if (pid != null && pid !== '' && String(pid) !== 'null') parentMessageId = String(pid)
   }
 
+  // 命令只在输入框层就该被吃掉；这里的匹配是网络层兜底（改版 / 语音发送漏过来的情况）
   var command = null
-  if (/^\/mem(\s|$)/.test(userText)) command = userText.trim()
+  if (/^\/(mem|sum)(\s|$)/.test(userText)) command = userText.trim()
 
   return {
     sessionId: sessionId,

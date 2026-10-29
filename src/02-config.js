@@ -47,7 +47,24 @@ export var CONFIG = {
 
   // ---- 输入框快捷指令（13.3 重做：命令在输入框就被吃掉，不产生请求）----
   CMD_PREFIX: '/mem',
-  CMD_KEYS: ['on', 'off', 'clear'],
+  CMD_KEYS: ['on', 'off', 'clear', 'sum'],
+
+  // ---- /sum 上下文压缩（手动 + 超阈值自动）----
+  // 做法：hook 输入框发一条 [总结所有] 的 user 消息 → 端点回摘要 → 摘要原样开一个新对话继续。
+  SUM_ENABLE: true,
+  SUM_PROMPT: '[总结所有]',
+  SUM_AUTO: true,                    // 超阈值自动触发（手动 /sum 不受此开关影响）
+  SUM_TRIGGER_TOKENS: 700000,        // 用户指定：约 70 万 token 触发；按需要下调即可
+  SUM_TOKEN_CJK: 0.6,                // 1 个中文字符 ≈ 0.6 token
+  SUM_TOKEN_OTHER: 0.3,              // 1 个英文字符 ≈ 0.3 token
+  SUM_COOLDOWN_MS: 60000,            // 两次自动压缩的最短间隔，防抖
+  SUM_MIN_TEXT_CHARS: 20,            // 摘要短于此长度视为失败，不开新对话
+  SUM_HANDOFF_CHARS: 20000,          // 交给新对话的摘要上限，超出截断
+  SUM_ARM_MS: 30000,                 // 发出 [总结所有] 后，认定「这条是本脚本发的」的时间窗
+  SUM_PENDING_TTL_MS: 600000,        // 新会话交接单的保质期，过期丢弃
+  SUM_INPUT_WAIT_MS: 20000,          // 新会话里等输入框出现的最长时间
+  SUM_AUTO_DELAY_MS: 800,            // 自动触发时给页面留的渲染时间
+  SUM_NEW_CHAT_URL: 'https://chat.deepseek.com/',
 
   // ---- 存储键（6.2）----
   KEY_PREFIX: 'ds_mem_e_',
@@ -56,6 +73,7 @@ export var CONFIG = {
   KEY_STATS: 'ds_mem_stats_v1',
   KEY_SESS_OFF: 'ds_mem_sessoff_v1',
   KEY_GLOBAL_OFF: 'ds_mem_global_off_v1',   // 总开关：/mem off 写这里
+  KEY_SUM_PENDING: 'ds_mem_sum_pending_v1', // /sum 摘要 → 新对话的交接单
 
   MEMORY_BLOCK_BEGIN: '[[DSMEM:v1 BEGIN]]',
   MEMORY_BLOCK_END: '[[DSMEM:v1 END]]',
