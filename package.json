@@ -1,0 +1,16 @@
+{
+  "name": "deepseek-web-mem",
+  "version": "1.0.0",
+  "private": false,
+  "type": "module",
+  "description": "DeepSeek 网页版本地记忆用户脚本：BM25 检索 + 原文注入，不调 Embedding、不联网检索",
+  "scripts": {
+    "build": "sh build.sh",
+    "test": "node test/all.mjs && node test/t40-xhr.mjs && node test/t60-cmd.mjs && node test/t50-machine.mjs"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Xiyinnnnnn/deepseek-web-mem.git"
+  }
+}
