@@ -45,6 +45,9 @@ function readValue(el) {
   return String(el.innerText != null ? el.innerText : (el.textContent || ''))
 }
 
+// 供压缩模块回读校验：写完值后要确认 React 没把输入框冲回空串
+export function readInputValue(el) { return readValue(el) }
+
 function fire(el, type) {
   try {
     if (typeof Event !== 'function' || !el.dispatchEvent) return

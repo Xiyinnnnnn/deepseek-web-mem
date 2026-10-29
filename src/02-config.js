@@ -63,6 +63,10 @@ export var CONFIG = {
   SUM_ARM_MS: 30000,                 // 发出 [总结所有] 后，认定「这条是本脚本发的」的时间窗
   SUM_PENDING_TTL_MS: 600000,        // 新会话交接单的保质期，过期丢弃
   SUM_INPUT_WAIT_MS: 20000,          // 新会话里等输入框出现的最长时间
+  SUM_RESUME_RETRY: 3,               // 新会话落地重试次数：React 水合会把刚写进去的值冲回空串
+  SUM_RESUME_SETTLE_MS: 500,         // 写值后等页面渲染稳定的时间，再回读校验值还在不在
+  SUM_SEND_VERIFY_MS: 1200,          // 触发发送后等多久确认「页面真的收下了」（输入框清空/会话 id 变化）
+  SUM_RESUME_RETRY_MS: 700,          // 两次落地重试之间的间隔
   SUM_AUTO_DELAY_MS: 800,            // 自动触发时给页面留的渲染时间
   SUM_NEW_CHAT_URL: 'https://chat.deepseek.com/',
 

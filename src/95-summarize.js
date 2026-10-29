@@ -14,7 +14,7 @@
 import { CONFIG } from './02-config.js'
 import { stats } from './01-stats.js'
 import { toast } from './80-context.js'
-import { findInput, writeValue, submitInput, waitForInput } from './85-input-command.js'
+import { findInput, writeValue, submitInput, waitForInput, readInputValue } from './85-input-command.js'
 
 // sessionStorage 优先（每个标签页一份，刷新即失效最符合「交接单」语义），
 // Via 等环境可能没有，退回 localStorage；都没有就只在本页内存里兜着。
@@ -34,13 +34,19 @@ function readPending() {
   } catch (e) { return null }
 }
 
-function writePending(text, from) {
+function writePending(text, from, fromUrl) {
   try {
     var b = bag()
     if (!b) return false
-    b.setItem(CONFIG.KEY_SUM_PENDING, JSON.stringify({ text: text, at: Date.now(), from: from || '' }))
+    b.setItem(CONFIG.KEY_SUM_PENDING, JSON.stringify({
+      text: text, at: Date.now(), from: from || '', fromUrl: fromUrl || ''
+    }))
     return true
   } catch (e) { return false }
+}
+
+function hrefNow() {
+  try { return String((location && location.href) || '') } catch (e) { return '' }
 }
 
 function dropPending() {
@@ -139,7 +145,7 @@ export function createCompressor(deps) {
     if (t.length > CONFIG.SUM_HANDOFF_CHARS) t = t.slice(0, CONFIG.SUM_HANDOFF_CHARS)
     var from = ''
     try { from = d.currentSession ? String(d.currentSession() || '') : '' } catch (e) {}
-    writePending(t, from)
+    writePending(t, from, hrefNow())
     try { if (d.onSummary) d.onSummary(t, from) } catch (e) {}
     stats.inc('sum_done')
     note('done len=' + t.length)
@@ -156,42 +162,116 @@ export function createCompressor(deps) {
     } catch (e) { note('nav-fail') }
   }
 
-  // 只有「新对话页」才灌摘要：地址栏还是 /a/chat/s/<id> 说明用户开的是旧会话，
-  // 此时灌进去等于污染旧对话，宁可把交接单留着等下一次跳到新对话。
-  function onFreshChatPage() {
+  // ---- 新会话落地：把摘要写成新对话的第一条 user 消息 ----
+  // 真机失败根因（1.0.1）：旧版是「地址里带 /a/chat/s/ 就跳过」，一刀切太狠 ——
+  // 新版页面在新对话里也会立刻把地址跳成 /a/chat/s/<新id>，于是交接单被永久挡住：
+  // 现象就是压缩请求发得出去、摘要也捕获到了，但新对话输入框一直空着（10 分钟后过期丢弃）。
+  // 现在只跳过「当前会话 id 就是交接单来源会话」这一种真·旧会话，另加三道保险：
+  //   ① 写值后回读（React 水合会把值冲回空串就重写）
+  //   ② 发送后确证（输入框被清空 / 会话 id 从空变有 才算页面收下了）
+  //   ③ 确认发出才删交接单，失败保留，给下次打开或 SPA 路由切换再试
+  var resuming = false
+  var tries = 0
+  var routeWatched = false
+
+  function sessionIdInUrl() {
     try {
-      var path = String((location && location.pathname) || '/')
-      return !/\/a\/chat\/s\//.test(path)
-    } catch (e) { return true }
+      var m = /\/chat\/s\/([A-Za-z0-9_-]+)/.exec(String((location && location.pathname) || ''))
+      return m ? m[1] : ''
+    } catch (e) { return '' }
   }
 
-  // ---- 新会话落地：把摘要写成新对话的第一条 user 消息 ----
+  function norm(s) { return String(s == null ? '' : s).replace(/\s+/g, '') }
+
   function resume() {
+    if (resuming) return false
     var pend = readPending()
     if (!pend) return false
-    if (Date.now() - (pend.at || 0) > CONFIG.SUM_PENDING_TTL_MS) { dropPending(); return false }
-    if (!onFreshChatPage()) { note('resume-skip-old-chat'); return false }
+    if (Date.now() - (pend.at || 0) > CONFIG.SUM_PENDING_TTL_MS) { dropPending(); note('resume-expired'); return false }
+    var cur = sessionIdInUrl()
+    if (cur && pend.from && cur === pend.from) { note('resume-skip-old-chat'); return false }
+    if (pend.fromUrl && hrefNow() === pend.fromUrl) { note('resume-skip-same-page'); return false }
+    resuming = true
+    tries = 0
     note('resume-wait')
     waitForInput(function (el) {
       if (!el) {
         // 不删交接单：下次打开页面还能继续
+        resuming = false
+        note('resume-no-input')
         toast('压缩：新对话输入框没出现，摘要已保留')
         return
       }
-      if (!writeValue(el, pend.text)) {
-        toast('压缩：摘要写入输入框失败')
-        return
-      }
-      submitInput(el, function () {
-        toast('压缩：摘要已填入，请手动点发送')
-      })
-      stats.inc('sum_resume')
-      note('resume-sent')
-      // 立刻删交接单：避免刷新一次重发一次；失败也宁可丢，也不重复发一堆摘要
-      dropPending()
-      toast('记忆：已把上一段对话的摘要发到新对话')
+      try { attempt(pend) } catch (e) { resuming = false }
     }, CONFIG.SUM_INPUT_WAIT_MS)
     return true
+  }
+
+  function attempt(pend) {
+    if (!resuming) return
+    var sidBefore = sessionIdInUrl()
+    var el = findInput()                       // 每次重新找：React 可能把旧节点整块换掉
+    if (!el) { retryLater(pend, 'no-input'); return }
+    if (!writeValue(el, pend.text)) { retryLater(pend, 'write-fail'); return }
+    setTimeout(function () {
+      if (!resuming) return
+      var back = readInputValue(findInput() || el)
+      if (norm(back) !== norm(pend.text)) { retryLater(pend, 'wiped'); return }
+      submitInput(el, function () { note('send-fallback') })
+      setTimeout(function () {
+        if (!resuming) return
+        // 页面收下的两个信号：输入框被清空，或地址栏会话 id 从空变成有
+        if (!norm(readInputValue(findInput() || el))) { landed(pend); return }
+        if (!sidBefore && sessionIdInUrl()) { landed(pend); return }
+        retryLater(pend, 'unsent')
+      }, CONFIG.SUM_SEND_VERIFY_MS)
+    }, CONFIG.SUM_RESUME_SETTLE_MS)
+  }
+
+  function retryLater(pend, why) {
+    note('resume-' + why)
+    if (tries++ < CONFIG.SUM_RESUME_RETRY) {
+      setTimeout(function () { try { attempt(pend) } catch (e) { resuming = false } }, CONFIG.SUM_RESUME_RETRY_MS)
+      return
+    }
+    resuming = false
+    // 不删交接单：宁可下次再试一次，也不要静默丢掉摘要
+    toast('压缩：摘要没发出去（' + why + '），已保留，下次进新对话再试')
+  }
+
+  function landed(pend) {
+    resuming = false
+    dropPending()                              // 确证发出才删单：避免刷新一次重发一次
+    stats.inc('sum_resume')
+    note('resume-sent len=' + String(pend.text || '').length)
+    toast('记忆：已把上一段对话的摘要发到新对话')
+  }
+
+  // SPA 里点「新对话」是 pushState，不重载页面，boot 时那次 resume 早跑完了；
+  // 挂在路由上再试一次，交接单还在就能落地。
+  function watchRoute() {
+    if (routeWatched) return
+    routeWatched = true
+    try { if (typeof window !== 'undefined' && window.addEventListener) window.addEventListener('popstate', poke) } catch (e) {}
+    try {
+      var h = (typeof history !== 'undefined' && history) ? history : null
+      if (h && typeof h.pushState === 'function') {
+        var push = h.pushState
+        h.pushState = function () { var r = push.apply(this, arguments); poke(); return r }
+        var rep = h.replaceState
+        if (typeof rep === 'function') {
+          h.replaceState = function () { var r = rep.apply(this, arguments); poke(); return r }
+        }
+      }
+    } catch (e) {}
+  }
+
+  function poke() {
+    try {
+      if (resuming) return
+      if (!readPending()) return
+      setTimeout(function () { if (!resuming) { try { resume() } catch (e) {} } }, 800)
+    } catch (e) {}
   }
 
   return {
@@ -201,6 +281,7 @@ export function createCompressor(deps) {
     maybeAuto: maybeAuto,
     finish: finish,
     resume: resume,
+    watchRoute: watchRoute,
     status: function () {
       return '压缩：' + (busy ? '进行中' : '空闲') +
         '；自动=' + (CONFIG.SUM_AUTO ? '开' : '关') +

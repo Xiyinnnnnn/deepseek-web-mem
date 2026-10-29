@@ -144,6 +144,8 @@ function boot() {
     }
   })
   try { compressor.resume() } catch (e) {}
+  // SPA 内跳到新对话不重载页面，靠路由监听补一次落地机会
+  try { compressor.watchRoute() } catch (e) {}
 
   // 输入框快捷指令：命令在这里就被吃掉，根本不会产生请求
   try { installInputCommand({ run: runCommandText }) } catch (e) {}

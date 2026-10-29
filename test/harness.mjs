@@ -43,7 +43,33 @@ export function makeEnv(opts) {
   globalThis.localStorage = localStorage
   globalThis.document = document
   globalThis.requestAnimationFrame = function (fn) { fn() }
-  globalThis.location = { href: 'https://chat.deepseek.com/a/chat/s/xyz', hash: '' }
+  // 地址栏：压缩流程要看 pathname 里的会话 id，SPA 路由测试还要能改它
+  function parseUrl(u) {
+    var str = String(u || '')
+    var m = /^(?:https?:\/\/[^/]+)?([^?#]*)/.exec(str)
+    var q = str.indexOf('?')
+    return {
+      href: str,
+      pathname: (m && m[1]) || '/',
+      search: q >= 0 ? str.slice(q) : '',
+      hash: ''
+    }
+  }
+  globalThis.location = parseUrl(opts.url || 'https://chat.deepseek.com/a/chat/s/xyz')
+
+  var hist = {
+    state: null,
+    pushState: function (st, title, u) {
+      hist.state = st
+      if (u) {
+        var p = parseUrl(u)
+        globalThis.location.href = /^https?:/.test(String(u)) ? p.href : 'https://chat.deepseek.com' + p.href
+        globalThis.location.pathname = p.pathname
+      }
+    },
+    replaceState: function (st, t, u) { hist.pushState(st, t, u) }
+  }
+  globalThis.history = hist
   globalThis.getSelection = function () { return { removeAllRanges: function () {}, addRange: function () {} } }
 
   if (opts.noSegmenter) {

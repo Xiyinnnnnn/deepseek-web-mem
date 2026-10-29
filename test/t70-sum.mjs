@@ -74,14 +74,33 @@ function override(extraCfg) {
   if (extraCfg) globalThis.__DSMEM_CONFIG_OVERRIDE = extraCfg
 }
 
-function makeTextarea(value) {
+function makeTextarea(value, opts) {
+  opts = opts || {}
   var el = {
     tagName: 'TEXTAREA', value: value == null ? '' : value, isContentEditable: false,
-    dispatchEvent: function () { return true },
+    sent: [],                       // autoSend=true 时记录「页面收下的内容」
+    wipeOnce: !!opts.wipeOnce,      // 模拟 React 水合把刚写进去的值冲回空串（只冲一次）
+    dispatchEvent: function (ev) {
+      var t = ev && ev.type
+      if (t === 'input' && el.wipeOnce) {
+        el.wipeOnce = false
+        setTimeout(function () { el.value = '' }, opts.wipeAt == null ? 10 : opts.wipeAt)
+      }
+      if (t === 'keydown' && opts.autoSend) {
+        setTimeout(function () { el.sent.push(el.value); el.value = '' }, 0)
+      }
+      return true
+    },
     focus: function () {},
     closest: function () { return null }
   }
   return el
+}
+
+// 直接摆一张交接单（模拟上一个页面存下的摘要）
+function putPending(text, from) {
+  globalThis.sessionStorage.setItem('ds_mem_sum_pending_v1',
+    JSON.stringify({ text: text, at: Date.now(), from: from || '' }))
 }
 
 function pressEnter(el) {
@@ -113,9 +132,8 @@ function msg(text, sess, parent) {
 
 var env, netlog, ds
 
-async function boot(kv, cfg, activeEl) {
-  if (kv) env = makeEnv({ kv: kv })
-  else env = makeEnv({})
+async function boot(kv, cfg, activeEl, url) {
+  env = makeEnv({ kv: kv || null, url: url || null })
   if (activeEl) globalThis.document.activeElement = activeEl
   delete globalThis.__ds_memory_rag_loaded
   delete globalThis.__dsMem
@@ -157,13 +175,15 @@ async function main() {
   ck('T80', '交接单写入 sessionStorage', !!(pend && pend.text && pend.text.length > 20), pend ? 'len=' + pend.text.length : 'null')
   ck('T81', 'toast 提示正在开新对话', /新开对话|新对话/.test(env.toasts[env.toasts.length - 1] || ''), env.toasts[env.toasts.length - 1])
 
-  console.log('\n[3] 新会话落地：交接单里的摘要被写成新对话第一条')
-  var ta2 = makeTextarea('')
+  console.log('\n[3] 新会话落地：摘要被写进新对话输入框并自动发出')
   var pendText = pend.text
-  await boot(env.kv, null, ta2)
-  await sleep(700)
-  ck('T82', '等输入框后自动填入摘要', ta2.value === pendText, 'len=' + ta2.value.length)
-  ck('T83', '交接单用后即删（避免重复发）', !globalThis.sessionStorage.getItem('ds_mem_sum_pending_v1'))
+  var fast = { SUM_RESUME_SETTLE_MS: 40, SUM_SEND_VERIFY_MS: 60, SUM_RESUME_RETRY_MS: 100 }
+  var ta2 = makeTextarea('', { autoSend: true })
+  await boot(env.kv, fast, ta2, 'https://chat.deepseek.com/a/chat/s/brand-new')
+  await sleep(900)
+  ck('T82', '新对话里摘要被填入并自动发出', ta2.sent.length === 1 && ta2.sent[0] === pendText,
+     'sent=' + ta2.sent.length + ' len=' + String(ta2.sent[0] || '').length)
+  ck('T83', '确证发出后才删交接单（避免重复发）', !globalThis.sessionStorage.getItem('ds_mem_sum_pending_v1'))
   ck('T84', '统计到一次落地', ds.stats().sum_resume === 1, 'sum_resume=' + ds.stats().sum_resume)
 
   console.log('\n[4] 估算口径：1 中文字符 0.6 token，1 英文字符 0.3 token')
@@ -209,6 +229,43 @@ async function main() {
   ck('T92', '带参数不触发压缩', ds.stats().sum_manual === 0)
   ck('T93', '/sum 用法提示', /可用指令/.test(env.toasts[env.toasts.length - 1] || ''), env.toasts[env.toasts.length - 1])
   ck('T94', '输入框已清空', ta6.value === '', 'value=' + ta6.value)
+
+  console.log('\n[8] 旧会话页不灌摘要：只有会话 id 与交接单来源一致才跳过')
+  putPending(pendText, 'sess-old')
+  var ta7 = makeTextarea('', { autoSend: true })
+  await boot(env.kv, fast, ta7, 'https://chat.deepseek.com/a/chat/s/sess-old')
+  await sleep(800)
+  ck('T95', '同会话 id → 不注入、不发', ta7.sent.length === 0 && ta7.value === '', 'sent=' + ta7.sent.length)
+  ck('T96', '交接单原样保留', !!globalThis.sessionStorage.getItem('ds_mem_sum_pending_v1'))
+
+  console.log('\n[9] 输入框的值被 React 冲掉一次 → 回读发现后重写，仍能发出')
+  putPending(pendText, 'sess-old')
+  var ta8 = makeTextarea('', { autoSend: true, wipeOnce: true })
+  await boot(env.kv, fast, ta8, 'https://chat.deepseek.com/')
+  await sleep(1500)
+  ck('T97', '冲掉后重写并发出摘要', ta8.sent.length === 1 && ta8.sent[0] === pendText, 'sent=' + ta8.sent.length)
+  ck('T98', '落地后删单', !globalThis.sessionStorage.getItem('ds_mem_sum_pending_v1'))
+  ck('T98b', '统计到一次落地', ds.stats().sum_resume === 1, 'sum_resume=' + ds.stats().sum_resume)
+
+  console.log('\n[10] 页面吞掉发送：重试用尽后交接单不丢')
+  putPending(pendText, 'sess-old')
+  var ta9 = makeTextarea('')          // autoSend=false：输入框一直是满的，模拟页面没收下
+  await boot(env.kv, { SUM_RESUME_SETTLE_MS: 20, SUM_SEND_VERIFY_MS: 20, SUM_RESUME_RETRY: 2, SUM_RESUME_RETRY_MS: 50 }, ta9, 'https://chat.deepseek.com/')
+  await sleep(1600)
+  ck('T99', '发不出去时交接单保留', !!globalThis.sessionStorage.getItem('ds_mem_sum_pending_v1'))
+  ck('T100', 'toast 说明已保留', env.toasts.some(function (t) { return /已保留/.test(t) }), env.toasts.join(' | ').slice(0, 90))
+
+  console.log('\n[11] SPA 点「新对话」不重载页面：靠路由监听补偿落地')
+  putPending(pendText, 'sess-old')
+  var ta10 = makeTextarea('', { autoSend: true })
+  await boot(env.kv, fast, ta10, 'https://chat.deepseek.com/a/chat/s/sess-old')
+  await sleep(600)
+  ck('T101', '旧会话页先不注入', ta10.sent.length === 0, 'sent=' + ta10.sent.length)
+  globalThis.document.activeElement = ta10
+  globalThis.history.pushState(null, '', '/')
+  await sleep(1800)
+  ck('T102', '路由切到新对话后自动注入并发出', ta10.sent.length === 1 && ta10.sent[0] === pendText, 'sent=' + ta10.sent.length)
+  ck('T103', '落地后删单', !globalThis.sessionStorage.getItem('ds_mem_sum_pending_v1'))
 
   console.log('\n================  ' + PASS + ' PASS / ' + FAIL + ' FAIL  ================')
   process.exit(FAIL ? 1 : 0)

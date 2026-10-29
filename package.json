@@ -1,6 +1,6 @@
 {
   "name": "deepseek-web-mem",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "private": false,
   "type": "module",
   "description": "DeepSeek 网页版本地记忆用户脚本：BM25 检索 + 原文注入，不调 Embedding、不联网检索",
